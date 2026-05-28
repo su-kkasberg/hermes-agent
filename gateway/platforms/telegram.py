@@ -3114,6 +3114,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_model_picker_callback(query, data, chat_id)
             return
 
+        # --- Work queue callbacks (wk:verb[:arg]) ---
+        if data.startswith("wk:"):
+            await self._handle_work_queue_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
@@ -3551,6 +3563,125 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 # Per-email one-shot: strip keyboard so the action can't fire twice.
                 await query.edit_message_text(text=appended, reply_markup=None)
+        except Exception:
+            pass
+
+    def _work_action_keyboard(self):
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Complete", callback_data="wk:act:complete"),
+                InlineKeyboardButton("🗄 Archive", callback_data="wk:act:archive"),
+            ],
+            [
+                InlineKeyboardButton("✍️ Draft", callback_data="wk:act:draft"),
+                InlineKeyboardButton("🔎 Research", callback_data="wk:act:research"),
+            ],
+            [
+                InlineKeyboardButton("⏭ Skip", callback_data="wk:act:skip"),
+                InlineKeyboardButton("📌 Done Local", callback_data="wk:act:done_local"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Refresh", callback_data="wk:show"),
+                InlineKeyboardButton("📊 Summary", callback_data="wk:summary"),
+            ],
+        ])
+
+    async def _run_work_queue_cmd(self, *args: str) -> tuple[int, str, str]:
+        cmd = ["bash", str(_Path.home() / ".hermes" / "scripts" / "triage_work.sh"), *args]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=30)
+        return proc.returncode or 0, out_b.decode("utf-8", errors="replace").strip(), err_b.decode("utf-8", errors="replace").strip()
+
+    def _work_is_actionable_output(self, text: str) -> bool:
+        t = (text or "").lower()
+        return ("item " in t and "actions:" in t) and ("queue complete" not in t)
+
+    async def _handle_work_start_command(self, msg: Message) -> bool:
+        text = (msg.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if not parts:
+            return False
+        cmd = parts[0].split("@", 1)[0].lower()
+        payload = (parts[1].strip().lower() if len(parts) > 1 else "")
+        if cmd != "/start":
+            return False
+
+        section_map = {
+            "work_top_actions": "top",
+            "work_reply_candidates": "replies",
+            "work_archive_candidates": "archive",
+            "work_risks": "risks",
+        }
+        section = section_map.get(payload)
+        if not section:
+            return False
+
+        rc, out, err = await self._run_work_queue_cmd("start", section)
+        body = out if out else (err or "Unable to start work queue.")
+        keyboard = self._work_action_keyboard() if (rc == 0 and self._work_is_actionable_output(body)) else None
+        try:
+            await msg.reply_text(body, reply_markup=keyboard)
+        except Exception:
+            pass
+        return True
+
+    async def _handle_work_queue_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized for this queue.")
+            return
+
+        parts = data.split(":")
+        verb = parts[1] if len(parts) > 1 else ""
+
+        if verb == "show":
+            rc, out, err = await self._run_work_queue_cmd("show")
+            body = out if out else (err or "No queue output.")
+        elif verb == "summary":
+            rc, out, err = await self._run_work_queue_cmd("summary")
+            body = out if out else (err or "No summary available.")
+        elif verb == "act" and len(parts) >= 3:
+            action = parts[2]
+            rc, out, err = await self._run_work_queue_cmd("act", action)
+            body = out if out else (err or f"Action failed: {action}")
+        else:
+            await query.answer(text="Invalid queue action")
+            return
+
+        if rc != 0:
+            await query.answer(text="❌ Queue action failed")
+            try:
+                await query.edit_message_text(text=body, reply_markup=self._work_action_keyboard())
+            except Exception:
+                pass
+            return
+
+        await query.answer(text="✓ Updated")
+        keep_keyboard = self._work_is_actionable_output(body)
+        try:
+            await query.edit_message_text(
+                text=body,
+                reply_markup=(self._work_action_keyboard() if keep_keyboard else None),
+            )
         except Exception:
             pass
 
@@ -4976,6 +5107,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
+
+        # Local "work now" deep-link router for email triage queue buttons.
+        # Supports: /start work_top_actions|work_reply_candidates|work_archive_candidates|work_risks
+        handled_work = await self._handle_work_start_command(msg)
+        if handled_work:
+            return
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
